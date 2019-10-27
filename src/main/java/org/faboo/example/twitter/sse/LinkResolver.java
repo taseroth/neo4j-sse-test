@@ -1,6 +1,9 @@
 package org.faboo.example.twitter.sse;
 
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
 import org.faboo.example.twitter.sse.util.BatchedSpliterator;
+import org.faboo.example.twitter.sse.util.RedirectResolver;
 import org.neo4j.graphdb.*;
 import org.neo4j.helpers.collection.Pair;
 import org.neo4j.procedure.Context;
@@ -29,20 +32,23 @@ public class LinkResolver {
     public void resolveLinks() {
 
         try {
-            int nbThreads = Runtime.getRuntime().availableProcessors() * 2;
+
+            CloseableHttpClient httpClient = HttpClients.createDefault();
+
+            int nbThreads = Runtime.getRuntime().availableProcessors();
+            log.info("starting {} number of treads", nbThreads);
             final BlockingQueue<Collection<Node>> queue = new ArrayBlockingQueue<>(nbThreads * 10);
             final ExecutorService executorService = Executors.newFixedThreadPool(nbThreads);
 
             Collection<Future<?>> futures = new ArrayList<>();
             for (int i = 0; i < nbThreads; i++) {
-                futures.add(executorService.submit(new ResolverRunner(queue)));
+                futures.add(executorService.submit(new ResolverRunner(queue,httpClient)));
             }
 
             BatchedSpliterator.batched(10,
                     db.findNodes(Label.label("Link")).stream()
                             .filter(node -> node.hasProperty("url"))
                             .filter(node -> !node.getRelationships(RelationshipType.withName("LINKS_TO")).iterator().hasNext())
-//                            .map(node -> (String) node.getProperty("url"))
                             .iterator())
                     .forEach(nodes -> {
                         try {
@@ -62,6 +68,7 @@ public class LinkResolver {
 
     private void terminateAndWait(ExecutorService executorService, Collection<Future<?>> futures,
                                   BlockingQueue<Collection<Node>> queue) throws InterruptedException {
+        queue.drainTo(new ArrayList<>()); // empty queue
         for (int i = 0; i < futures.size(); i++) {
             queue.put(poisonPill);
         }
@@ -78,10 +85,12 @@ public class LinkResolver {
 
     private class ResolverRunner implements Runnable {
 
-        final BlockingQueue<Collection<Node>> queue;
+        private final BlockingQueue<Collection<Node>> queue;
+        private final CloseableHttpClient httpClient;
 
-        private ResolverRunner(BlockingQueue<Collection<Node>> queue) {
+        private ResolverRunner(BlockingQueue<Collection<Node>> queue, CloseableHttpClient client) {
             this.queue = queue;
+            this.httpClient = client;
             log.debug("created ResolverRunner");
         }
 
@@ -89,7 +98,7 @@ public class LinkResolver {
         public void run() {
 
             log.debug("running ResolverRunner");
-            RedirectResolver resolver = new RedirectResolver();
+            RedirectResolver resolver = new RedirectResolver(httpClient);
 
             Collection<Node> work;
             try {
@@ -105,18 +114,26 @@ public class LinkResolver {
 
                         results.forEach(pair -> {
                             if (pair.other().isError()) {
+                                log.warn("reporting url {} with error: {}",
+                                        pair.other().getUrl(), pair.other().getError());
                                 pair.first().setProperty("errorCode", pair.other().getError().getStatus());
                                 pair.first().setProperty("errorMessage", pair.other().getError().getMessage());
                             } else {
                                 Node urlNode = findOrCreateUrlNode(pair.other().getUrl());
                                 pair.first().createRelationshipTo(urlNode, RelationshipType.withName("LINKS_TO"));
+                                Node siteNode = findOrCreateSiteNode(pair.other().getHostName());
+                                urlNode.createRelationshipTo(siteNode, RelationshipType.withName("PART_OF"));
                             }
-
                         });
+                        log.debug("closing transaction");
                         tx.success();
-                    } catch (MultipleFoundException e) {
-                        log.error("node for url already exists", e);
+                    } catch (DatabaseShutdownException e) {
+                        log.error("leaving runnable", e);
+                        return;
+                    } catch (Exception e) {
+                        log.error("error processing nodes", e);
                     }
+                    log.debug("finished processing {} entries", work.size());
                 } while (true);
             } catch (InterruptedException e) {
                 log.error("interrupted while waiting for work", e);
@@ -130,6 +147,16 @@ public class LinkResolver {
                 log.debug("creating Url node for {}", url);
                 node = db.createNode(Label.label("Url"));
                 node.setProperty("url", url);
+            }
+            return node;
+        }
+
+        private Node findOrCreateSiteNode(String site) {
+            Node node = db.findNode(Label.label("Site"), "name", site);
+            if (null == node) {
+                log.debug("creating Site node for {}", site);
+                node = db.createNode(Label.label("Site"));
+                node.setProperty("name", site);
             }
             return node;
         }

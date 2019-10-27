@@ -1,15 +1,36 @@
-package org.faboo.example.twitter.sse;
+package org.faboo.example.twitter.sse.util;
 
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpHead;
+import org.apache.http.impl.client.CloseableHttpClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.HttpURLConnection;
-import java.net.URL;
+import java.net.MalformedURLException;
 
+/**
+ * Resolver that follows http redirects to the end and report the final url.
+ */
 public class RedirectResolver {
 
-    private final Logger log = LoggerFactory.getLogger(RedirectResolver.class);
+    private final static Logger log = LoggerFactory.getLogger(RedirectResolver.class);
+
+    private final CloseableHttpClient httpClient;
+    private final RequestConfig requestConfig;
+    private final static HostResolver hostResolver = new HostResolver();
+
+    public RedirectResolver(CloseableHttpClient httpClient) {
+        this.httpClient = httpClient;
+        this.requestConfig = RequestConfig.custom()
+                .setSocketTimeout(5000)
+                .setConnectTimeout(5000)
+                .setConnectionRequestTimeout(5000)
+                .setRedirectsEnabled(false)
+                .build();
+    }
 
     public ResolveResult resolve(String url) {
 
@@ -21,6 +42,7 @@ public class RedirectResolver {
             do {
                 ResolveResult resolveStatus = resolveOnce(nextUrl);
                 if (resolveStatus.isResolved()) {
+
                     return resolveStatus;
                 }
                 hopsRemaining--;
@@ -35,13 +57,12 @@ public class RedirectResolver {
 
     private ResolveResult resolveOnce(String urlString) throws ResolveException {
 
-        try {
-            URL url = new URL(urlString);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setInstanceFollowRedirects(false);
-            conn.setReadTimeout(5000);
-            conn.setRequestMethod("HEAD");
-            int status = conn.getResponseCode();
+        HttpHead head = new HttpHead(urlString);
+        head.setConfig(requestConfig);
+
+        try (CloseableHttpResponse response = httpClient.execute(head)) {
+
+            int status = response.getStatusLine().getStatusCode();
             if (status == HttpURLConnection.HTTP_OK) {
                 return ResolveResult.resolved(urlString);
             }
@@ -50,12 +71,25 @@ public class RedirectResolver {
                     || status == HttpURLConnection.HTTP_MOVED_PERM
                     || status == HttpURLConnection.HTTP_SEE_OTHER) {
 
-                return ResolveResult.moved(conn.getHeaderField("Location"));
+                return ResolveResult.moved(response.getLastHeader("Location").getValue());
             }
-            throw new ResolveException(new ResolveError(status, conn.getResponseMessage()));
+            throw new ResolveException(new ResolveError(status, response.getStatusLine().getReasonPhrase()));
         } catch (IOException e) {
-            throw new ResolveException(new ResolveError(-1, e.getMessage()));
+            log.error("error resolving " + urlString, e);
+            throw new ResolveException(new ResolveError(-1, findRootError(e)));
         }
+    }
+
+    private String findRootError(Exception e) {
+
+        String message;
+        Throwable next = e;
+        do {
+            message = next.getMessage();
+            next = next.getCause();
+        } while (message == null);
+
+        return message;
     }
 
     public static class ResolveException extends Exception {
@@ -66,7 +100,7 @@ public class RedirectResolver {
             this.error = error;
         }
 
-        public ResolveError getError() {
+        ResolveError getError() {
             return error;
         }
     }
@@ -75,7 +109,7 @@ public class RedirectResolver {
         private final int status;
         private final String message;
 
-        public ResolveError(int status, String httpMessage) {
+        ResolveError(int status, String httpMessage) {
             this.status = status;
             this.message = httpMessage;
         }
@@ -87,6 +121,14 @@ public class RedirectResolver {
         public String getMessage() {
             return message;
         }
+
+        @Override
+        public String toString() {
+            return "ResolveError{" +
+                    "status=" + status +
+                    ", message='" + message + '\'' +
+                    '}';
+        }
     }
 
     public static class ResolveResult {
@@ -94,23 +136,29 @@ public class RedirectResolver {
         private final boolean resolved;
         private final String url;
         private final ResolveError error;
+        private final String hostName;
 
         static ResolveResult resolved(String finalUrl) {
-            return new ResolveResult(true, finalUrl, null);
+            try {
+                return new ResolveResult(true, finalUrl, hostResolver.getCleanedHost(finalUrl), null);
+            } catch (MalformedURLException e) {
+                return new ResolveResult(false, finalUrl, null, new ResolveError(-3, e.getMessage()));
+            }
         }
 
         static ResolveResult moved(String nextUrl) {
-            return new ResolveResult(false, nextUrl, null);
+            return new ResolveResult(false, nextUrl, null, null);
         }
 
         static ResolveResult error(String url, ResolveError error) {
-            return new ResolveResult(false, url, error);
+            return new ResolveResult(false, url, null, error);
         }
 
-        private ResolveResult(boolean resolved, String url, ResolveError error) {
+        private ResolveResult(boolean resolved, String url, String hostName, ResolveError error) {
             this.resolved = resolved;
             this.url = url;
             this.error = error;
+            this.hostName = hostName;
         }
 
         public boolean isResolved() {
@@ -127,6 +175,10 @@ public class RedirectResolver {
 
         public ResolveError getError() {
             return error;
+        }
+
+        public String getHostName() {
+            return hostName;
         }
 
         @Override
